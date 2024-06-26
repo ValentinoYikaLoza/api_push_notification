@@ -16,6 +16,7 @@ const pool = new Pool({
   port: 5432,
   database: "db",
 });
+
 const MESSAGING_SCOPE = "https://www.googleapis.com/auth/firebase.messaging";
 const SCOPES = [MESSAGING_SCOPE];
 
