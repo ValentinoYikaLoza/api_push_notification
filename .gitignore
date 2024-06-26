@@ -1,3 +1,4 @@
 node_modules
 firebase-admin.json
 package-lock.json
+ngrok.exe
