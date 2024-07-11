@@ -1,4 +1,5 @@
 const express = require("express");
+const { v5: uuidv5 } = require("uuid");
 const { Pool } = require("pg");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcrypt");
@@ -23,6 +24,7 @@ const SCOPES = [MESSAGING_SCOPE];
 const app = express();
 const port = 3000;
 const secretKey = "shadow"; // Clave secreta para firmar JWT
+const namespace = uuidv5(secretKey, uuidv5.DNS); // Genera un UUID v5 basado en la palabra secretKey
 const saltRounds = 10; // Número de rondas para el hashing de la contraseña
 
 // Middleware para analizar el cuerpo de las solicitudes como JSON
@@ -377,16 +379,6 @@ app.post("/api/loginGoogle", async (req, res) => {
       return;
     }
 
-    const passwordMatch = await bcrypt.compare(
-      decodedHeader.payload.sub,
-      user.password
-    );
-
-    if (!passwordMatch) {
-      res.status(401).json({ status: 401, message: "Contraseña incorrecta" });
-      return;
-    }
-
     const token = jwt.sign({ userId: user.id }, secretKey, { expiresIn: "1h" }); // Firmar token con el ID del usuario
     client.release();
     res
@@ -446,12 +438,72 @@ app.post("/api/login", async (req, res) => {
   }
 });
 
+// Endpoint para iniciar sesión con huella digital
+app.post("/api/loginWithFingerprint", async (req, res) => {
+  const { username, device_info_token } = req.body;
+
+  if (!device_info_token) {
+    return res.status(400).json({
+      status: 400,
+      message: "Falta el token de información del dispositivo",
+    });
+  }
+
+  const fingerprintToken = uuidv5(device_info_token, namespace);
+
+  try {
+    const client = await pool.connect();
+
+    // Verificar si el usuario existe y tiene la huella digital habilitada
+    const result = await client.query(
+      "SELECT id, username, fingerprint_token FROM users WHERE username = $1 AND fingerprint_token = $2",
+      [username, fingerprintToken]
+    );
+
+    const user = result.rows[0];
+
+    if (!user) {
+      client.release();
+      return res
+        .status(401)
+        .json({ status: 401, message: "Usuario no encontrado" });
+    }
+
+    if (!user.fingerprint_token) {
+      client.release();
+      return res.status(403).json({
+        status: 403,
+        message: "La huella digital no está habilitada para este usuario",
+      });
+    }
+
+    // Generar un token JWT para el usuario
+    const token = jwt.sign({ userId: user.id }, secretKey, { expiresIn: "1h" });
+
+    client.release();
+
+    // Devolver el token de acceso
+    res.status(200).json({
+      status: 200,
+      message: "Inicio de sesión exitoso con huella digital",
+      token: token,
+    });
+  } catch (err) {
+    console.error("Error al iniciar sesión con huella digital", err);
+    res.status(500).json({
+      status: 500,
+      message:
+        "Error interno del servidor al iniciar sesión con huella digital",
+    });
+  }
+});
+
 // Endpoint para obtener la información del usuario conectado
 app.get("/api/getUser", authenticateToken, async (req, res) => {
   try {
     const client = await pool.connect();
     const result = await client.query(
-      "SELECT id, username FROM users WHERE id = $1",
+      "SELECT id, username, fingerprint_token FROM users WHERE id = $1",
       [req.user.userId]
     );
     const user = result.rows[0];
@@ -463,9 +515,16 @@ app.get("/api/getUser", authenticateToken, async (req, res) => {
         .json({ status: 404, message: "Usuario no encontrado" });
     }
 
+    const hasFingerprintToken = user.fingerprint_token !== null;
+
     res
       .status(200)
-      .json({ status: 200, message: "Petición exitosa", user: user });
+      .json({
+        status: 200,
+        message: "Petición exitosa",
+        user: user,
+        hasFingerprintToken: hasFingerprintToken,
+      });
   } catch (err) {
     console.error("Error al obtener la información del usuario", err);
     res
@@ -592,6 +651,116 @@ app.get("/api/getNotifications", authenticateToken, async (req, res) => {
     res
       .status(500)
       .json({ status: 500, message: "Error interno del servidor" });
+  }
+});
+
+// Endpoint para alternar la habilitación de la huella digital de un usuario
+app.post("/api/toggleFingerprint", authenticateToken, async (req, res) => {
+  const userId = req.user.userId;
+  const { device_info_token } = req.body;
+
+  if (!device_info_token) {
+    return res.status(400).json({
+      status: 400,
+      message: "Falta el token de información del dispositivo",
+    });
+  }
+
+  const fingerprintToken = uuidv5(device_info_token, namespace);
+
+  try {
+    const client = await pool.connect();
+
+    // Obtener el usuario actual
+    const userResult = await client.query(
+      "SELECT fingerprint_token FROM users WHERE id = $1",
+      [userId]
+    );
+
+    const currentFingerprintToken = userResult.rows[0].fingerprint_token;
+
+    let newFingerprintToken = null;
+
+    if (currentFingerprintToken) {
+      newFingerprintToken = null;
+    } else {
+      newFingerprintToken = fingerprintToken;
+    }
+
+    // Actualizar el campo fingerprint_token para el usuario especificado
+    const result = await client.query(
+      "UPDATE users SET fingerprint_token = $1 WHERE id = $2 RETURNING *",
+      [newFingerprintToken, userId]
+    );
+
+    client.release();
+
+    if (result.rowCount > 0) {
+      res.status(200).json({
+        status: 200,
+        message: `La huella digital ha sido ${
+          newFingerprintToken ? "habilitada" : "deshabilitada"
+        } exitosamente`,
+      });
+    } else {
+      res.status(404).json({
+        status: 404,
+        message: "Usuario no encontrado",
+      });
+    }
+  } catch (error) {
+    console.error("Error al alternar la huella digital", error);
+    res.status(500).json({
+      status: 500,
+      message: "Error interno del servidor",
+      error: error.message,
+    });
+  }
+});
+
+// Endpoint para obtener usuarios con huella digital habilitada
+app.get("/api/usersWithFingerprintToken", async (req, res) => {
+  const { device_info_token } = req.body;
+
+  if (!device_info_token) {
+    return res.status(400).json({
+      status: 400,
+      message: "Falta el token de información del dispositivo",
+    });
+  }
+
+  const fingerprintToken = uuidv5(device_info_token, namespace);
+
+  try {
+    const client = await pool.connect();
+
+    // Consultar usuarios con huella digital habilitada
+    const result = await client.query(
+      "SELECT username, account_type FROM users WHERE fingerprint_token = $1",
+      [fingerprintToken]
+    );
+
+    client.release();
+
+    const users = result.rows;
+
+    // Devolver la lista de usuarios con huella digital habilitada
+    res.status(200).json({
+      status: 200,
+      message: "Usuarios con huella digital habilitada obtenidos exitosamente",
+      users: users,
+    });
+  } catch (error) {
+    console.error(
+      "Error al obtener usuarios con huella digital habilitada",
+      error
+    );
+    res.status(500).json({
+      status: 500,
+      message:
+        "Error interno del servidor al obtener usuarios con huella digital habilitada",
+      error: error.message,
+    });
   }
 });
 
